@@ -9,14 +9,14 @@
 # --setup  : หลังสร้าง S3 แล้ว แพ็ก zip ต่อ function (+ common/ + data_contract/) แล้วสร้างหรืออัปเดต Lambda
 #   ตัวแปรของ --setup (ไม่บังคับ):
 #     ROLE_ARN  (ค่าเริ่มต้น arn:aws:iam::<account id>:role/LabRole)
-#     LAYER_ARN (ค่าเริ่มต้น หา AWS SDK for pandas layer ของ Python 3.12 ใน region ให้เอง)
+#     LAYER_ARN (ค่าเริ่มต้น AWS SDK for pandas Python312 version 32; เปลี่ยนเลข version ด้วย LAYER_VERSION)
 #     LAMBDA_PREFIX (nyc-taxi) LAMBDA_RUNTIME (python3.12) LAMBDA_TIMEOUT (900)
 #     LAMBDA_MEMORY (3008) LAMBDA_EPHEMERAL (5120)
 # รันซ้ำได้ (idempotent): ถ้า bucket, โฟลเดอร์ หรือ Lambda มีอยู่แล้วจะข้าม/อัปเดตแทนสร้างใหม่
 set -euo pipefail
 
 PREFIXES=(incoming raw trusted curated quarantine)
-DEFAULT_REGION="ap-southeast-1"
+DEFAULT_REGION="us-east-1"
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -109,13 +109,9 @@ for f in "${FUNCTIONS[@]}"; do
 done
 
 # layer ที่มี pyarrow: AWS SDK for pandas (managed layer ของ AWS บัญชี 336392948345)
-if [[ -z "${LAYER_ARN:-}" ]]; then
-  LAYER_ARN="$(aws lambda list-layer-versions --region "$REGION" \
-    --layer-name "arn:aws:lambda:${REGION}:336392948345:layer:AWSSDKPandas-Python312" \
-    --query 'LayerVersions[0].LayerVersionArn' --output text 2>/dev/null || true)"
-  [[ -n "$LAYER_ARN" && "$LAYER_ARN" != "None" ]] \
-    || die "หา AWS SDK for pandas layer ไม่ได้ ตั้งเองได้ เช่น LAYER_ARN=arn:aws:lambda:$REGION:336392948345:layer:AWSSDKPandas-Python312:<version> bash infra/deploy.sh --setup"
-fi
+# ค่าเริ่มต้น = AWSSDKPandas-Python312 version 32 (us-east-1) เปลี่ยนได้ด้วย LAYER_VERSION หรือ LAYER_ARN
+LAYER_VERSION="${LAYER_VERSION:-32}"
+LAYER_ARN="${LAYER_ARN:-arn:aws:lambda:${REGION}:336392948345:layer:AWSSDKPandas-Python312:${LAYER_VERSION}}"
 
 log ""
 log "== Lambda | role: $ROLE_ARN"
