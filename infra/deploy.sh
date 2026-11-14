@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy.sh - สร้าง S3 bucket พร้อมโฟลเดอร์ incoming/ raw/ trusted/ curated/
+# deploy.sh - สร้าง S3 bucket พร้อมโฟลเดอร์ incoming/ raw/ trusted/ curated/ quarantine/
 #
 # วิธีใช้:  bash infra/deploy.sh [BUCKET_NAME] [REGION]
 #   หรือกำหนดด้วยตัวแปร:  BUCKET_NAME=... AWS_REGION=... bash infra/deploy.sh
@@ -8,7 +8,7 @@
 # รันซ้ำได้ (idempotent): ถ้า bucket หรือโฟลเดอร์มีอยู่แล้วจะข้าม
 set -euo pipefail
 
-PREFIXES=(incoming raw trusted curated)
+PREFIXES=(incoming raw trusted curated quarantine)
 DEFAULT_REGION="ap-southeast-1"
 
 log() { printf '%s\n' "$*"; }
