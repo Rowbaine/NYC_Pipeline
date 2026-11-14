@@ -10,10 +10,11 @@
 # หลังสร้าง S3 แล้ว แพ็ก zip ต่อ function (+ common/ + data_contract/) แล้วสร้างหรืออัปเดต Lambda
 #   ตัวแปรของขั้น Lambda (ไม่บังคับ):
 #     ROLE_ARN  (ค่าเริ่มต้น arn:aws:iam::<account id>:role/LabRole)
-#     LAYER_ARN (ค่าเริ่มต้น AWS SDK for pandas Python312 version 32; เปลี่ยนเลข version ด้วย LAYER_VERSION)
+#     LAYER_ARN (ไม่ใส่ = ใช้/สร้าง layer <prefix>-pyarrow ที่มี zstd เอง; REBUILD_LAYER=1 สร้างใหม่; PYARROW_VERSION)
 #     LAMBDA_PREFIX (nyc-taxi) LAMBDA_RUNTIME (python3.12) LAMBDA_TIMEOUT (900)
 #     LAMBDA_MEMORY (3008) LAMBDA_EPHEMERAL (5120)
-# --run    : อ่านไฟล์ .parquet ทั้งหมดใน incoming/ แล้วรันทีละไฟล์ batch -> ingest -> validate -> transform -> quarantine -> verify
+# --run    : อ่านไฟล์ .parquet ทั้งหมดใน incoming/ แล้วรันทีละไฟล์ batch -> ingest -> validate -> transform -> [quarantine] -> verify (-> curated)
+#            quarantine รันเฉพาะเมื่อมีแถวไม่ผ่าน; verify ผ่านแล้วจึงคัดลอกไป curated/
 #            ไฟล์ที่ล้มเหลวจะถูกข้าม รันไฟล์อื่นต่อ แล้วสรุปผลท้ายสุด (exit 1 ถ้ามีไฟล์ล้มเหลว) ต้อง deploy Lambda ไว้ก่อน
 # รันซ้ำได้ (idempotent): ถ้า bucket, โฟลเดอร์ หรือ Lambda มีอยู่แล้วจะข้าม/อัปเดตแทนสร้างใหม่
 set -euo pipefail
@@ -106,6 +107,9 @@ print(v)' "$1" "$2" | tr -d '\r'; }
     failed=""; result=""
     for f in "${CHAIN[@]}"; do
       fname="${LAMBDA_PREFIX}-${f//_/-}"
+      if [[ "$f" == "quarantine_function" && "$(json_get in.json rows_invalid)" == "0" ]]; then
+        log "    ข้าม: $f (ไม่มีแถวที่ไม่ผ่าน)"; continue
+      fi
       if ! invoke "$fname" in.json out.json; then
         failed="$f"; break
       fi
@@ -119,7 +123,7 @@ print(v)' "$1" "$2" | tr -d '\r'; }
       SKIP=$((SKIP + 1)); SUMMARY+=("SKIPPED    $key  (batch นี้ verify แล้ว)")
     else
       OK=$((OK + 1))
-      SUMMARY+=("VERIFIED   $key  valid=$(json_get out.json rows_valid) quarantine=$(json_get out.json rows_quarantined)")
+      SUMMARY+=("VERIFIED   $key  valid=$(json_get out.json rows_valid) quarantine=$(json_get out.json rows_invalid) curated=$(json_get out.json rows_curated)")
     fi
   done
 
@@ -191,17 +195,52 @@ for f in "${FUNCTIONS[@]}"; do
   [[ -f "$LAMBDA_DIR/$f/lambda_function.py" ]] || die "ไม่พบ $LAMBDA_DIR/$f/lambda_function.py"
 done
 
-# layer ที่มี pyarrow: AWS SDK for pandas (managed layer ของ AWS บัญชี 336392948345)
-# ค่าเริ่มต้น = AWSSDKPandas-Python312 version 32 (us-east-1) เปลี่ยนได้ด้วย LAYER_VERSION หรือ LAYER_ARN
-LAYER_VERSION="${LAYER_VERSION:-32}"
-LAYER_ARN="${LAYER_ARN:-arn:aws:lambda:${REGION}:336392948345:layer:AWSSDKPandas-Python312:${LAYER_VERSION}}"
-
 log ""
 log "== Lambda | role: $ROLE_ARN"
-log "           layer: $LAYER_ARN"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+
+# layer ที่มี pyarrow (รองรับ zstd ซึ่งไฟล์ TLC ใช้ แต่ layer สำเร็จรูปของ AWS ไม่รองรับ)
+# ใช้ LAYER_ARN ที่กำหนดเอง หรือ layer ชื่อ <prefix>-pyarrow ที่มีอยู่แล้ว หรือสร้างใหม่จาก pip (REBUILD_LAYER=1 บังคับสร้างใหม่)
+LAYER_NAME="${LAMBDA_PREFIX}-pyarrow"
+PYARROW_VERSION="${PYARROW_VERSION:-25.0.1}"
+if [[ -z "${LAYER_ARN:-}" && "${REBUILD_LAYER:-0}" != "1" ]]; then
+  LAYER_ARN="$(aws lambda list-layer-versions --layer-name "$LAYER_NAME" --region "$REGION" \
+    --query 'LayerVersions[0].LayerVersionArn' --output text 2>/dev/null || true)"
+  [[ "$LAYER_ARN" != "None" ]] || LAYER_ARN=""
+fi
+if [[ -z "${LAYER_ARN:-}" || "${REBUILD_LAYER:-0}" == "1" ]]; then
+  log "สร้าง layer $LAYER_NAME (pyarrow==$PYARROW_VERSION สำหรับ ${LAMBDA_RUNTIME}) ใช้เวลาสักครู่..."
+  PYVER="${LAMBDA_RUNTIME#python}"
+  "$PY" -m pip install --quiet --disable-pip-version-check --target "$WORK/layer/python" \
+    --platform manylinux2014_x86_64 --platform manylinux_2_28_x86_64 \
+    --python-version "$PYVER" --implementation cp --only-binary=:all: "pyarrow==$PYARROW_VERSION" \
+    || die "ติดตั้ง pyarrow==$PYARROW_VERSION สำหรับ layer ไม่สำเร็จ (ตรวจอินเทอร์เน็ต/เวอร์ชัน)"
+  (cd "$WORK" && "$PY" - layer pyarrow-layer.zip <<'PYEOF'
+import os, sys, zipfile
+src, out = sys.argv[1:3]
+skip_dirs = {"__pycache__", "include", "tests"}
+skip_ext = (".pxd", ".pyx", ".pxi", ".h", ".hpp")
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for f in sorted(files):
+            if not f.endswith(skip_ext):
+                p = os.path.join(root, f)
+                z.write(p, os.path.relpath(p, src).replace(os.sep, "/"))
+PYEOF
+  )
+  LAYER_KEY="_layers/${LAYER_NAME}.zip"
+  (cd "$WORK" && aws s3 cp pyarrow-layer.zip "s3://$BUCKET/$LAYER_KEY" --region "$REGION" >/dev/null) \
+    || die "อัปโหลด layer ไป s3://$BUCKET/$LAYER_KEY ไม่สำเร็จ"
+  LAYER_ARN="$(aws lambda publish-layer-version --layer-name "$LAYER_NAME" --region "$REGION" \
+    --description "pyarrow==$PYARROW_VERSION (with zstd)" --compatible-runtimes "$LAMBDA_RUNTIME" \
+    --content "S3Bucket=$BUCKET,S3Key=$LAYER_KEY" --query LayerVersionArn --output text)" \
+    || die "สร้าง layer ไม่สำเร็จ"
+  log "  สร้าง layer แล้ว: $LAYER_ARN"
+fi
+log "           layer: $LAYER_ARN"
 
 # zip: lambda_function.py อยู่ราก + common/ + data_contract/ (เฉพาะ .py)
 make_zip() {  # $1 = ชื่อโฟลเดอร์ function, $2 = ไฟล์ zip ปลายทาง

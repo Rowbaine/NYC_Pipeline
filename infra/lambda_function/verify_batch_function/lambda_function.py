@@ -1,11 +1,12 @@
-"""VerifyBatch: ตรวจว่า batch ครบและไม่ซ้ำ แล้วเขียน trusted/.../_SUCCESS
+"""VerifyBatch: ตรวจว่า batch ครบและไม่ซ้ำ -> คัดลอกไฟล์ที่ผ่านไป curated/ -> เขียน trusted/.../_SUCCESS
 
 ตรวจ 4 ข้อ (อ่านจำนวนแถวจาก footer ของ Parquet ใน S3)
   1. raw = trusted + quarantine           (ไม่มีแถวหาย/เกิน)
   2. แถวใน trusted ตรงกับ rows_valid
   3. แถวใน quarantine ตรงกับ rows_invalid (หรือไม่มีไฟล์ถ้าเป็น 0)
   4. ใต้ trusted/.../ มีไฟล์ข้อมูลไฟล์เดียว (ไม่ซ้ำ)  -> รันซ้ำแล้วไม่เกิดไฟล์เพิ่ม
-ไม่ผ่าน -> raise BatchVerificationError (ไม่เขียน _SUCCESS จึงรันซ้ำได้)
+ผ่านแล้ว: copy trusted -> curated/{type}/{year}/{batch_id}/ แล้วตรวจจำนวนแถวของสำเนา จากนั้นเขียน _SUCCESS เป็นขั้นสุดท้าย
+ไม่ผ่านหรือ copy ไม่สำเร็จ -> raise (ไม่เขียน _SUCCESS จึงรันซ้ำได้)
 """
 from common import pipeline as p
 
@@ -39,9 +40,17 @@ def lambda_handler(event, context=None):
     if problems:
         raise p.BatchVerificationError(f"batch {ctx['batch_id']} ไม่ผ่านการตรวจ: " + "; ".join(problems))
 
+    # ผ่าน verify แล้วจึงนำเข้า curated (เขียนทับ key เดิมจึงรันซ้ำได้ไม่ซ้ำซ้อน)
+    p.copy(bucket, p.trusted_key(ctx), p.curated_key(ctx))
+    curated_rows = p.parquet_num_rows(bucket, p.curated_key(ctx))
+    if curated_rows != trusted_rows:
+        raise p.BatchVerificationError(f"batch {ctx['batch_id']}: curated {curated_rows} != trusted {trusted_rows}")
+
+    # _SUCCESS เป็นขั้นสุดท้าย: มีไฟล์นี้ = batch เสร็จสมบูรณ์ถึง curated แล้ว
     p.put_json(bucket, p.success_key(ctx), {
         "batch_id": ctx["batch_id"], "verified_at": p.utc_now_iso(),
         "rows_raw": raw_rows, "rows_trusted": trusted_rows, "rows_quarantine": quarantine_rows,
+        "rows_curated": curated_rows,
     })
-    ctx.update(status="VERIFIED", verified=True)
+    ctx.update(status="VERIFIED", verified=True, curated_key=p.curated_key(ctx), rows_curated=curated_rows)
     return ctx

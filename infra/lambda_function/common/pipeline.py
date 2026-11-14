@@ -10,7 +10,7 @@
   raw/{type}/{year}/{batch_id}/_validated/             ผลของ ValidateFunction (valid.parquet, invalid.parquet, report.json)
   trusted/{type}/{year}/{batch_id}/{file}.parquet      ผลของ TransformFunction (+ _SUCCESS จาก VerifyBatch)
   quarantine/{type}/{year}/{batch_id}/                 แถวที่ไม่ผ่าน (invalid.parquet, report.json)
-  curated/                                             ยังไม่ใช้
+  curated/{type}/{year}/{batch_id}/{file}.parquet      สำเนาจาก trusted หลังผ่าน VerifyBatch
 """
 from __future__ import annotations
 
@@ -94,6 +94,8 @@ def report_key(ctx):             return staging_prefix(ctx) + "report.json"
 def trusted_prefix(ctx):         return f"{TRUSTED}/{_partition(ctx)}/"
 def trusted_key(ctx):            return trusted_prefix(ctx) + ctx["filename"]
 def success_key(ctx):            return trusted_prefix(ctx) + "_SUCCESS"
+def curated_prefix(ctx):         return f"{CURATED}/{_partition(ctx)}/"
+def curated_key(ctx):            return curated_prefix(ctx) + ctx["filename"]
 def quarantine_prefix(ctx):      return f"{QUARANTINE}/{_partition(ctx)}/"
 def quarantine_data_key(ctx):    return quarantine_prefix(ctx) + "invalid.parquet"
 def quarantine_report_key(ctx):  return quarantine_prefix(ctx) + "report.json"

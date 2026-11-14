@@ -1,6 +1,7 @@
 """QuarantineFunction: ถ้ามีแถวที่ไม่ผ่าน ย้ายสำเนา invalid.parquet + report.json ไป quarantine/{type}/{year}/{batch_id}/
 
 ไม่มีแถวที่ไม่ผ่าน -> ไม่สร้างอะไรใน quarantine/ (rows_quarantined = 0)
+ตัวควบคุม (deploy.sh --run) จะไม่เรียกฟังก์ชันนี้เลยเมื่อ rows_invalid = 0 แต่ถ้าถูกเรียกก็ปลอดภัย
 """
 from common import pipeline as p
 
