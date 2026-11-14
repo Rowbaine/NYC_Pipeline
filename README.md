@@ -199,6 +199,8 @@ python script/compare_taxi_types.py <BUCKET_NAME> us-east-1
 
 ![ผลการวิเคราะห์](docs/image/outputfile.png)
 
+จากข้อมูลใน `curated/` (เฉพาะแถวที่ผ่าน data contract) แท็กซี่ประเภท **FHVHV** (เช่น Uber, Lyft) ถูกใช้มากที่สุดในครึ่งปีแรกของ 2024 จำนวน 119,980,309 เที่ยว คิดเป็น 82.13% ของทั้งหมด รองลงมาคือ Yellow (12.10%), FHV (5.56%) และ Green (0.21%) และ FHVHV เป็นอันดับหนึ่งในทุกเดือน (81.4%–82.9%)
+
 ## 7. Pipeline / Data Flow Diagram
 
 ```mermaid
