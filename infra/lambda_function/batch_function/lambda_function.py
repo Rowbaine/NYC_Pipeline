@@ -1,6 +1,6 @@
 """BatchFunction: สร้าง batch_id จากไฟล์ใน incoming/ และตรวจ batch ซ้ำ (ต่อประเภท ต่อเดือน)
 
-Input : {"key": "incoming/yellow/yellow_tripdata_2024-01.parquet"} หรือ S3 event, "bucket" (ไม่บังคับ)
+Input : {"key": "incoming/yellow_tripdata_2024-01.parquet"} หรือ S3 event, "bucket" (ไม่บังคับ)
 Output: ctx ที่มี batch_id, taxi_type, year, month, filename, source_key, bucket, duplicate
         duplicate = True เมื่อ batch นี้ผ่าน VerifyBatch แล้ว (มี trusted/.../_SUCCESS) -> ขั้นต่อไปจะข้าม
 """

@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # deploy.sh - สร้าง S3 bucket พร้อมโฟลเดอร์ incoming/ raw/ trusted/ curated/ quarantine/
-#             และ (ด้วย --setup) สร้าง/อัปเดต Lambda 6 ตัวจากโฟลเดอร์ infra/lambda_function/
+#             และสร้าง/อัปเดต Lambda 6 ตัวจากโฟลเดอร์ infra/lambda_function/
 #
-# วิธีใช้:  bash infra/deploy.sh [--setup] [BUCKET_NAME] [REGION]
+# วิธีใช้:  bash infra/deploy.sh [BUCKET_NAME] [REGION]
+#           bash infra/deploy.sh --run [BUCKET_NAME] [REGION]   # สั่งรัน pipeline (ไม่สร้าง S3/Lambda)
 #   หรือกำหนดด้วยตัวแปร:  BUCKET_NAME=... AWS_REGION=... bash infra/deploy.sh
 # ค่าเริ่มต้น: BUCKET_NAME = nyc-taxi-pipeline-<AWS account id>
 #             REGION = ค่าที่ตั้งไว้ใน aws configure (ถ้าไม่มี ใช้ ap-southeast-1)
-# --setup  : หลังสร้าง S3 แล้ว แพ็ก zip ต่อ function (+ common/ + data_contract/) แล้วสร้างหรืออัปเดต Lambda
-#   ตัวแปรของ --setup (ไม่บังคับ):
+# หลังสร้าง S3 แล้ว แพ็ก zip ต่อ function (+ common/ + data_contract/) แล้วสร้างหรืออัปเดต Lambda
+#   ตัวแปรของขั้น Lambda (ไม่บังคับ):
 #     ROLE_ARN  (ค่าเริ่มต้น arn:aws:iam::<account id>:role/LabRole)
 #     LAYER_ARN (ค่าเริ่มต้น AWS SDK for pandas Python312 version 32; เปลี่ยนเลข version ด้วย LAYER_VERSION)
 #     LAMBDA_PREFIX (nyc-taxi) LAMBDA_RUNTIME (python3.12) LAMBDA_TIMEOUT (900)
 #     LAMBDA_MEMORY (3008) LAMBDA_EPHEMERAL (5120)
+# --run    : อ่านไฟล์ .parquet ทั้งหมดใน incoming/ แล้วรันทีละไฟล์ batch -> ingest -> validate -> transform -> quarantine -> verify
+#            ไฟล์ที่ล้มเหลวจะถูกข้าม รันไฟล์อื่นต่อ แล้วสรุปผลท้ายสุด (exit 1 ถ้ามีไฟล์ล้มเหลว) ต้อง deploy Lambda ไว้ก่อน
 # รันซ้ำได้ (idempotent): ถ้า bucket, โฟลเดอร์ หรือ Lambda มีอยู่แล้วจะข้าม/อัปเดตแทนสร้างใหม่
 set -euo pipefail
 
@@ -26,10 +29,14 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-SETUP=0
+RUN=0
 ARGS=()
 for a in "$@"; do
-  if [[ "$a" == "--setup" ]]; then SETUP=1; else ARGS+=("$a"); fi
+  case "$a" in
+    --setup) ;;            # ยังรับได้ (เหมือนเดิม) แต่ไม่จำเป็นแล้ว
+    --run) RUN=1 ;;
+    *) ARGS+=("$a") ;;
+  esac
 done
 set -- ${ARGS[@]+"${ARGS[@]}"}
 
@@ -45,6 +52,84 @@ REGION="${REGION:-$DEFAULT_REGION}"
   || die "ชื่อ bucket ไม่ถูกต้อง '$BUCKET' (ใช้ a-z 0-9 . - ยาว 3-63 ตัว ขึ้นต้นและลงท้ายด้วยตัวอักษรหรือตัวเลข)"
 
 log "Account: $ACCOUNT_ID | Bucket: $BUCKET | Region: $REGION"
+
+# เลือก python ที่รันได้จริง (บน Windows python3 อาจเป็นตัวหลอกของ Microsoft Store ที่รันไม่ได้)
+PY=""
+for cand in python3 python py; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import zipfile" >/dev/null 2>&1; then PY="$cand"; break; fi
+done
+[[ -n "$PY" ]] || die "ไม่พบ python ที่ใช้งานได้ (ใช้สร้างไฟล์ zip) ลองติดตั้ง Python หรือปิด App execution aliases ของ python ใน Windows Settings"
+
+# ---------------------------------------------------------------- --run: สั่งรัน pipeline
+if [[ $RUN -eq 1 ]]; then
+  LAMBDA_PREFIX="${LAMBDA_PREFIX:-nyc-taxi}"
+  CHAIN=(batch_function ingest_function validate_function transform_function quarantine_function verify_batch_function)
+
+  keys="$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "incoming/" --region "$REGION" \
+    --query "Contents[?ends_with(Key, '.parquet')].Key" --output text 2>/dev/null || true)"
+  [[ -n "$keys" && "$keys" != "None" ]] || die "ไม่พบไฟล์ .parquet ใน s3://$BUCKET/incoming/ (อัปโหลดไฟล์ก่อน)"
+  mapfile -t KEYS < <(printf '%s\n' $keys | tr -d '\r' | sort)
+  log "พบ ${#KEYS[@]} ไฟล์ใน incoming/ | รันทีละไฟล์: ${CHAIN[*]}"
+
+  WORK="$(mktemp -d)"
+  trap 'rm -rf "$WORK"' EXIT
+  cd "$WORK"
+
+  json_get() { PYTHONUTF8=1 PYTHONIOENCODING=utf-8 "$PY" -c 'import json,sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    v = d.get(sys.argv[2], "") if isinstance(d, dict) else ""
+except Exception:
+    v = ""
+print(v)' "$1" "$2" | tr -d '\r'; }
+
+  # รัน Lambda ทีละตัว: $1 = ชื่อ function, $2 = ไฟล์ payload, $3 = ไฟล์ผลลัพธ์ -> คืน 0 เมื่อสำเร็จ (ข้อผิดพลาดเก็บใน ERR_MSG)
+  invoke() {
+    local fe
+    if ! fe="$(aws lambda invoke --function-name "$1" --region "$REGION" --cli-read-timeout 0 \
+        --payload "fileb://$2" --query FunctionError --output text "$3" 2>&1)"; then
+      ERR_MSG="เรียก $1 ไม่ได้: $fe"; return 1
+    fi
+    if [[ "$fe" != "None" && -n "$fe" ]]; then
+      ERR_MSG="$(json_get "$3" errorType): $(json_get "$3" errorMessage)"; return 1
+    fi
+    return 0
+  }
+
+  OK=0; SKIP=0; FAIL=0; SUMMARY=()
+  i=0
+  for key in "${KEYS[@]}"; do
+    i=$((i + 1))
+    log ""
+    log "[$i/${#KEYS[@]}] $key"
+    printf '{"key": "%s", "bucket": "%s"}' "$key" "$BUCKET" > in.json
+    failed=""; result=""
+    for f in "${CHAIN[@]}"; do
+      fname="${LAMBDA_PREFIX}-${f//_/-}"
+      if ! invoke "$fname" in.json out.json; then
+        failed="$f"; break
+      fi
+      log "    ผ่าน: $f"
+      cp out.json in.json
+      if [[ "$(json_get out.json duplicate)" == "True" ]]; then result="DUPLICATE"; break; fi
+    done
+    if [[ -n "$failed" ]]; then
+      FAIL=$((FAIL + 1)); SUMMARY+=("FAILED     $key  [$failed] $ERR_MSG"); log "    ล้มเหลวที่ $failed: $ERR_MSG"
+    elif [[ "$result" == "DUPLICATE" ]]; then
+      SKIP=$((SKIP + 1)); SUMMARY+=("SKIPPED    $key  (batch นี้ verify แล้ว)")
+    else
+      OK=$((OK + 1))
+      SUMMARY+=("VERIFIED   $key  valid=$(json_get out.json rows_valid) quarantine=$(json_get out.json rows_quarantined)")
+    fi
+  done
+
+  log ""
+  log "== สรุป =="
+  printf '%s\n' "${SUMMARY[@]}"
+  log "สำเร็จ $OK | ข้าม $SKIP | ล้มเหลว $FAIL | รวม ${#KEYS[@]}"
+  [[ $FAIL -eq 0 ]] || exit 1
+  exit 0
+fi
 
 # 1) สร้าง bucket (ข้ามถ้ามีอยู่แล้วและเข้าถึงได้)
 set +e
@@ -87,9 +172,7 @@ done
 
 log "เสร็จ: s3://$BUCKET/ มีโฟลเดอร์ ${PREFIXES[*]}"
 
-[[ $SETUP -eq 1 ]] || exit 0
-
-# ---------------------------------------------------------------- --setup: Lambda
+# ---------------------------------------------------------------- Lambda
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAMBDA_DIR="$SCRIPT_DIR/lambda_function"
 CONTRACT_DIR="$SCRIPT_DIR/../script/data_contract"
@@ -101,8 +184,8 @@ LAMBDA_MEMORY="${LAMBDA_MEMORY:-3008}"
 LAMBDA_EPHEMERAL="${LAMBDA_EPHEMERAL:-5120}"
 ROLE_ARN="${ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/LabRole}"
 
-PY="$(command -v python3 || command -v python || true)"
-[[ -n "$PY" ]] || die "ไม่พบ python3/python (ใช้สร้างไฟล์ zip)"
+# จากตรงนี้ ถ้าคำสั่งไหนล้มเหลวแล้วสคริปต์หยุด ให้บอกบรรทัดที่พัง (กันกรณีหยุดเงียบๆ)
+trap 'printf "ERROR: คำสั่งล้มเหลวที่บรรทัด %s (exit %s)\n" "$LINENO" "$?" >&2' ERR
 [[ -d "$LAMBDA_DIR/common" && -d "$CONTRACT_DIR" ]] || die "ไม่พบโฟลเดอร์ lambda_function/common หรือ script/data_contract"
 for f in "${FUNCTIONS[@]}"; do
   [[ -f "$LAMBDA_DIR/$f/lambda_function.py" ]] || die "ไม่พบ $LAMBDA_DIR/$f/lambda_function.py"

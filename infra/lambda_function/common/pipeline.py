@@ -5,7 +5,7 @@
 - ฟังก์ชันอ่าน/เขียน S3 ด้วย boto3
 
 โครงสร้างใน S3 (bucket เดียว) batch_id = {type}_{YYYY-MM} เช่น yellow_2024-01
-  incoming/{type}/{file}.parquet                       ไฟล์ที่เข้ามา
+  incoming/{file}.parquet                              ไฟล์ที่เข้ามา (วางตรงๆ ไม่แยกประเภท; รับ incoming/{type}/{file} ด้วย)
   raw/{type}/{year}/{batch_id}/{file}.parquet          ผลของ IngestFunction
   raw/{type}/{year}/{batch_id}/_validated/             ผลของ ValidateFunction (valid.parquet, invalid.parquet, report.json)
   trusted/{type}/{year}/{batch_id}/{file}.parquet      ผลของ TransformFunction (+ _SUCCESS จาก VerifyBatch)
@@ -54,19 +54,19 @@ def extract_source(event: dict):
     if records and "s3" in records[0]:
         s3_info = records[0]["s3"]
         return unquote_plus(s3_info["object"]["key"]), s3_info.get("bucket", {}).get("name")
-    raise PipelineError('event ต้องมี "key" (เช่น incoming/yellow/yellow_tripdata_2024-01.parquet) หรือเป็น S3 event')
+    raise PipelineError('event ต้องมี "key" (เช่น incoming/yellow_tripdata_2024-01.parquet) หรือเป็น S3 event')
 
 
 def parse_source_key(key: str) -> dict:
-    """incoming/yellow/yellow_tripdata_2024-01.parquet -> ข้อมูล batch"""
+    """incoming/yellow_tripdata_2024-01.parquet (หรือ incoming/yellow/yellow_tripdata_2024-01.parquet) -> ข้อมูล batch"""
     parts = key.split("/")
-    if len(parts) != 3 or parts[0] != INCOMING:
-        raise PipelineError(f"key ต้องอยู่ในรูป incoming/<type>/<file>.parquet : {key}")
-    folder, filename = parts[1], parts[2]
+    if parts[0] != INCOMING or len(parts) not in (2, 3):
+        raise PipelineError(f"key ต้องอยู่ในรูป incoming/<file>.parquet หรือ incoming/<type>/<file>.parquet : {key}")
+    folder, filename = (parts[1] if len(parts) == 3 else None), parts[-1]
     m = _SOURCE_RE.match(filename)
     if not m:
         raise PipelineError(f"ชื่อไฟล์ไม่ตรงรูปแบบ <type>_tripdata_YYYY-MM.parquet : {filename}")
-    if m["type"] != folder:
+    if folder is not None and m["type"] != folder:
         raise PipelineError(f"โฟลเดอร์ ({folder}) ไม่ตรงกับประเภทในชื่อไฟล์ ({m['type']})")
     month = int(m["month"])
     if not 1 <= month <= 12:
