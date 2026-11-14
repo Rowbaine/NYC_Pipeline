@@ -1,7 +1,7 @@
 """Data contract rules สำหรับ ValidateFunction / TransformFunction
 
 ตัวอย่างการใช้งาน
-    from jobs.data_contract import get_ruleset, evaluate
+    from script.data_contract import get_ruleset, evaluate
     rs = get_ruleset("green")
     counts, block_mask = evaluate(table, rs.RULES)
 """
